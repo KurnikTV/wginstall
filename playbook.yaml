@@ -1,0 +1,242 @@
+---
+- name: Deploy WireGuard VPN Server
+  hosts: localhost
+  connection: local
+  become: true
+  vars:
+    wg_interface: "wg0"
+    wg_port: 51820
+    wg_network: "10.8.0.1/24"
+    wg_dns: "1.1.1.1"
+    wg_persistent_keepalive: 25
+    wg_endpoint: "{{ ansible_default_ipv4.address }}"
+    wg_forward_interface: "ens18"
+    
+    wg_client_name: "client1"
+    wg_client_ip: "10.8.0.2/32"
+    
+    wg_dir: "/etc/wireguard"
+    wg_server_key: "{{ wg_dir }}/server_private.key"
+    wg_server_pub: "{{ wg_dir }}/server_public.key"
+    wg_client_key: "{{ wg_dir }}/clients/{{ wg_client_name }}_private.key"
+    wg_client_pub: "{{ wg_dir }}/clients/{{ wg_client_name }}_public.key"
+
+  tasks:
+    # Проверка интернет-соединения
+    - name: Test internet connectivity
+      ping:
+        data: "Ansible test ping"
+      register: ping_test
+      until: ping_test is success
+      retries: 3
+      delay: 5
+      changed_when: false
+
+    # Обновление APT с повторами
+    - name: Update apt cache (retry on failure)
+      apt:
+        update_cache: yes
+      register: apt_update
+      until: apt_update is success
+      retries: 3
+      delay: 10
+      ignore_errors: true
+
+    # Установка пакетов
+    - name: Install required packages
+      apt:
+        name:
+          - wireguard
+          - wireguard-tools
+          - qrencode
+          - iptables-persistent
+        state: present
+        update_cache: no
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    # Создание рабочих директорий
+    - name: Create WireGuard directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: 0700
+      with_items:
+        - "{{ wg_dir }}"
+        - "{{ wg_dir }}/clients"
+
+    # Генерация ключей сервера
+    - name: Generate server private key
+      command: wg genkey
+      register: server_private_key
+      changed_when: false
+      no_log: true
+
+    - name: Save server private key
+      copy:
+        content: "{{ server_private_key.stdout }}"
+        dest: "{{ wg_server_key }}"
+        mode: 0600
+
+    - name: Generate server public key
+      command: "wg pubkey"
+      register: server_public_key
+      changed_when: false
+      no_log: true
+      args:
+        stdin: "{{ server_private_key.stdout }}"
+
+    - name: Save server public key
+      copy:
+        content: "{{ server_public_key.stdout }}"
+        dest: "{{ wg_server_pub }}"
+        mode: 0644
+
+    # Генерация ключей клиента
+    - name: Generate client private key
+      command: wg genkey
+      register: client_private_key
+      changed_when: false
+      no_log: true
+
+    - name: Save client private key
+      copy:
+        content: "{{ client_private_key.stdout }}"
+        dest: "{{ wg_client_key }}"
+        mode: 0600
+
+    - name: Generate client public key
+      command: "wg pubkey"
+      register: client_public_key
+      changed_when: false
+      no_log: true
+      args:
+        stdin: "{{ client_private_key.stdout }}"
+
+    - name: Save client public key
+      copy:
+        content: "{{ client_public_key.stdout }}"
+        dest: "{{ wg_client_pub }}"
+        mode: 0644
+
+    # Создание шаблонов конфигурации
+    - name: Create server template directory
+      file:
+        path: "{{ playbook_dir }}/templates"
+        state: directory
+        mode: 0755
+
+    - name: Generate server.conf.j2 template
+      copy:
+        dest: "{{ playbook_dir }}/templates/server.conf.j2"
+        content: |
+          [Interface]
+          Address = {{ wg_network }}
+          PrivateKey = {{ lookup('file', wg_server_key) }}
+          ListenPort = {{ wg_port }}
+          PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {{ wg_forward_interface }} -j MASQUERADE
+          PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {{ wg_forward_interface }} -j MASQUERADE
+
+          [Peer]
+          PublicKey = {{ lookup('file', wg_client_pub) }}
+          AllowedIPs = {{ wg_client_ip }}
+        mode: 0644
+
+    - name: Generate client.conf.j2 template
+      copy:
+        dest: "{{ playbook_dir }}/templates/client.conf.j2"
+        content: |
+          [Interface]
+          PrivateKey = {{ lookup('file', wg_client_key) }}
+          Address = {{ wg_client_ip.split('/')[0] }}
+          DNS = {{ wg_dns }}
+
+          [Peer]
+          PublicKey = {{ lookup('file', wg_server_pub) }}
+          Endpoint = {{ wg_endpoint }}:{{ wg_port }}
+          AllowedIPs = 0.0.0.0/0
+          PersistentKeepalive = {{ wg_persistent_keepalive }}
+        mode: 0644
+
+    # Конфигурация сервера
+    - name: Create server config
+      template:
+        src: "{{ playbook_dir }}/templates/server.conf.j2"
+        dest: "{{ wg_dir }}/{{ wg_interface }}.conf"
+        mode: 0600
+      notify: restart wireguard
+
+    # Включение IP forwarding
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 1
+        state: present
+        reload: yes
+        sysctl_set: yes
+
+    # Настройка iptables
+    - name: Configure iptables firewall rules
+      block:
+        - name: Allow WireGuard port
+          iptables:
+            chain: INPUT
+            protocol: udp
+            destination_port: "{{ wg_port }}"
+            jump: ACCEPT
+            comment: "Allow WireGuard"
+            state: present
+
+        - name: Setup NAT masquerade
+          iptables:
+            table: nat
+            chain: POSTROUTING
+            out_interface: "{{ wg_forward_interface }}"
+            jump: MASQUERADE
+            comment: "WireGuard NAT"
+            state: present
+
+        - name: Save iptables rules
+          shell: iptables-save > /etc/iptables/rules.v4
+          changed_when: false
+
+    # Запуск и включение сервиса
+    - name: Enable and start WireGuard service
+      systemd:
+        name: "wg-quick@{{ wg_interface }}"
+        enabled: yes
+        state: started
+
+    # Регистрация конфигурации клиента
+    - name: Generate client configuration
+      template:
+        src: "{{ playbook_dir }}/templates/client.conf.j2"
+        dest: "{{ wg_dir }}/clients/{{ wg_client_name }}.conf"
+        mode: 0600
+
+  post_tasks:
+    # Отображение клиентской конфигурации
+    - name: Show client configuration
+      debug:
+        msg: |
+          =============== CLIENT CONFIG ===============
+          [Interface]
+          PrivateKey = {{ lookup('file', wg_client_key) }}
+          Address = {{ wg_client_ip.split('/')[0] }}
+          DNS = {{ wg_dns }}
+          
+          [Peer]
+          PublicKey = {{ lookup('file', wg_server_pub) }}
+          Endpoint = {{ wg_endpoint }}:{{ wg_port }}
+          AllowedIPs = 0.0.0.0/0
+          PersistentKeepalive = {{ wg_persistent_keepalive }}
+          =============================================
+          
+          QR Code: sudo qrencode -t ansiutf8 < {{ wg_dir }}/clients/{{ wg_client_name }}.conf
+
+  handlers:
+    - name: restart wireguard
+      systemd:
+        name: "wg-quick@{{ wg_interface }}"
+        state: restarted
+        enabled: yes
