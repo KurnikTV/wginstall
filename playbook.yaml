@@ -216,22 +216,20 @@
 
   post_tasks:
     # Отображение клиентской конфигурации
-    - name: Show client configuration
-      debug:
-        msg: |
-          =============== CLIENT CONFIG ===============
-          [Interface]
-          PrivateKey = {{ lookup('file', wg_client_key) }}
-          Address = {{ wg_client_ip.split('/')[0] }}
-          DNS = {{ wg_dns }}
-          
-          [Peer]
-          PublicKey = {{ lookup('file', wg_server_pub) }}
-          Endpoint = {{ wg_endpoint }}:{{ wg_port }}
-          AllowedIPs = 0.0.0.0/0
-          PersistentKeepalive = {{ wg_persistent_keepalive }}
-          =============================================
-          
+- name: Show client configuration
+    debug:
+      msg: |
+          =============== CLIENT CONFIG ===============\n
+          [Interface]\n
+          PrivateKey = {{ lookup('file', wg_client_key) }}\n
+          Address = {{ wg_client_ip.split('/')[0] }}\n
+          DNS = {{ wg_dns }}\n\n
+          [Peer]\n
+          PublicKey = {{ lookup('file', wg_server_pub) }}\n
+          Endpoint = {{ wg_endpoint }}:{{ wg_port }}\n
+          AllowedIPs = 0.0.0.0/0\n
+          PersistentKeepalive = {{ wg_persistent_keepalive }}\n
+          =============================================\n\n
           QR Code: sudo qrencode -t ansiutf8 < {{ wg_dir }}/clients/{{ wg_client_name }}.conf
 
   handlers:
